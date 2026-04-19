@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12",features = ["ndarray","cuda","directml"] } # ONNX Runtime 的 Rust 綁定
-ndarray = "0.17.2"
+#ort = { version = "2.0.0-rc.12",features = ["ndarray","cuda","directml"] } # ONNX Runtime 的 Rust 綁定
+#ndarray = "0.17.2"
 
 log = "0.4.29"
 # simple_logger = { version = "5.1.0",features = ["timestamps","stderr"] }
@@ -13,7 +13,10 @@ flexi_logger = { version = "^0.31", features = ["default"] }
 
 windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse","Win32_Graphics_Dwm"] }
 windows-capture = "1.5.0"
-image = "0.25.10"
-show-image = "0.14"
+opencv = "0.95.1"
+
+#image = "0.25.10"
+#show-image = "0.14"
 
 bytes = "1.11.1"
+rand = "0.10.1"

@@ -1,11 +1,13 @@
 use bytes::{BufMut, BytesMut};
 use log::{debug, error};
+use opencv::core::{CV_8UC4, Mat};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use image::{DynamicImage, ImageBuffer, Rgb, RgbImage, Rgba};
+// use image::{DynamicImage, ImageBuffer, Rgb, RgbImage, Rgba};
+use crate::capture_settings::CapturePos;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
 use windows_capture::settings::{
@@ -18,7 +20,6 @@ use windows_capture::{
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
 };
-use crate::capture_settings::CapturePos;
 
 pub struct GrabItem {
     buffer: Mutex<BytesMut>,
@@ -187,27 +188,27 @@ impl DxgiCaptureRs {
         true
     }
 
-    pub fn grab(&self, capture_pos: &CapturePos) ->Result<DynamicImage,PoisonError<MutexGuard<BytesMut>>>{
+    pub fn grab(&self, capture_pos: &CapturePos) -> Mat {
         let (left, top, width, height) = capture_pos.rect;
         let right = width + left;
         let bottom = height + top;
         self.grab_internal(left as u32, top as u32, right as u32, bottom as u32);
         match self.handler_arc.buffer.lock() {
-            Ok(mut buffer) =>  {
-                let bgra_view = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, buffer.as_mut()).unwrap();
-                // 2. 建立一個新的 RgbImage 用於存儲結果
-                let mut rgb_img = RgbImage::new(width as u32, height as u32);
-
-                // 3. 遍歷並轉換：同時完成「去掉 A」與「BGR 轉 RGB」
-                for (bgra_pixel, rgb_pixel) in bgra_view.pixels().zip(rgb_img.pixels_mut()) {
-                    let [b, g, r, _a] = bgra_pixel.0; // 解構並丟棄 alpha
-                    *rgb_pixel = Rgb([r, g, b]);      // 重新排列為 RGB
-                }
-                Ok(DynamicImage::ImageRgb8(rgb_img))
+            Ok(mut buffer) => unsafe {
+                Mat::new_rows_cols_with_data_unsafe_def(
+                    height,
+                    width,
+                    CV_8UC4,
+                    buffer.as_mut_ptr() as *mut _,
+                )
+                .unwrap_or_else(|_e| {
+                    error!("grab failed, create mat from buffer error: {:?}", _e);
+                    Mat::default()
+                })
             },
             Err(e) => {
                 error!("grab failed, get buffer lock error: {:?}", e);
-                Err(e)
+                Mat::default()
             }
         }
     }
