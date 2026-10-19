@@ -11,18 +11,18 @@ panic = "abort"
 debug = "none"
 
 [dependencies]
-#ort = { version = "2.0.0-rc.12", features = ["default", "ndarray","download-binaries", "directml"] } # ONNX Runtime 的 Rust 綁定
-#cudarc = { version = "0.13",features = ["cuda-12080"] }
-#ndarray = "0.17.2"
+# ONNX Runtime 的 Rust 綁定；default 已包含 download-binaries + ndarray，directml feature 会下载带 DML 的 ORT
+# load-dynamic：运行时加载 libs/onnxruntime.dll。opencv(vcpkg 静态) 自带 libprotobuf，
+# 与静态链接的 ORT 符号冲突（LNK2005，加 /FORCE:MULTIPLE 也会在运行时崩 protobuf），只能走动态加载。
+# api-24 对应 ONNX Runtime 1.24.x（NuGet 的 Microsoft.ML.OnnxRuntime.DirectML 最新版）。
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "directml", "api-24"] }
+
+# std：set_boxed_logger 在 log 0.4 里由 "std" feature 提供
+log = { version = "0.4.29", features = ["std"] }
+flexi_logger = { version = "0", features = ["default"] }
+
+windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Devices_Display", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_System_WinRT", "Win32_System_WinRT_Graphics_Capture", "Win32_System_WinRT_Direct3D11"] }
+
+[dev-dependencies]
+# 只有 cargo test 的自检（导出 PNG 对照）用它，正式程序不链接 OpenCV
 opencv = "0.98.2"
-
-log = "0.4.29"
-# simple_logger = { version = "5.1.0",features = ["timestamps","stderr"] }
-#flexi_logger = { version = "^0.31", features = ["default"] }
-
-windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common"] }
-windows-capture = "1.5.0"
-#image = "0.25.10"
-#show-image = "0.14"
-
-bytes = "1.11.1"
