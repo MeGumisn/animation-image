@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, GetSysColorBrush, UpdateWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -15,7 +16,7 @@ use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetFocus, SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const ID_LIST: i32 = 1001;
@@ -588,7 +589,8 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_COMMAND => {
                 let id = (wparam.0 & 0xFFFF) as i32;
-                log::info!("选择界面：WM_COMMAND id={id}");
+                let code = (wparam.0 >> 16) as u16; // 通知码
+                log::info!("选择界面：WM_COMMAND id={id} code={code}");
                 // 只认按钮点击：列表框在自动选中首项时也会发通知，别被它误触发
                 if id == ID_OK {
                     accept(hwnd);
@@ -597,6 +599,9 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 } else if id == IDCANCEL.0 as i32 {
                     // Esc：关掉界面（等于取消），不至于卡在这里只能去任务栏退出
                     let _ = DestroyWindow(hwnd);
+                } else if id == ID_LIST && code == 2 {
+                    // LBN_DBLCLK：双击列表项 = 直接开始渲染，省得非要点到按钮
+                    accept(hwnd);
                 }
                 LRESULT(0)
             }
@@ -610,7 +615,35 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                log::info!("选择界面：WM_ACTIVATE（是否拿到焦点）");
+                // 0 = WA_INACTIVE，1 = WA_ACTIVE，2 = WA_CLICKACTIVE（被鼠标点中）
+                let code = (wparam.0 & 0xFFFF) as u32;
+                let fg = GetForegroundWindow();
+                log::info!(
+                    "选择界面：WM_ACTIVATE code={code} 前台={:?}「{}」焦点={:?}",
+                    fg,
+                    window_title_of(fg),
+                    GetFocus()
+                );
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_PARENTNOTIFY => {
+                // 子控件上的鼠标按下会先转发给父窗口：用它确认点击到底有没有落到控件上
+                let ev = (wparam.0 & 0xFFFF) as u32;
+                if ev == WM_LBUTTONDOWN || ev == WM_RBUTTONDOWN {
+                    let child = HWND(lparam.0 as *mut core::ffi::c_void);
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    log::info!(
+                        "选择界面：控件被点击 {child:?}，光标 ({},{})，该位置窗口 {:?}",
+                        pt.x,
+                        pt.y,
+                        WindowFromPoint(pt)
+                    );
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONDOWN => {
+                log::info!("选择界面：客户区空白处被点击");
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -678,6 +711,29 @@ unsafe fn center_on_work_area(hwnd: HWND) {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 强制把界面拿到前台。
+/// 全屏游戏在前台时 `SetForegroundWindow` 常被系统的前台锁定挡掉（返回成功但没真正激活），
+/// 先临时挂到前台线程的输入队列再设置，成功率最高。
+unsafe fn force_foreground(hwnd: HWND) {
+    unsafe {
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        let fg = GetForegroundWindow();
+        if fg != hwnd {
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            let cur_tid = GetCurrentThreadId();
+            if fg_tid != 0 && fg_tid != cur_tid {
+                let _ = AttachThreadInput(cur_tid, fg_tid, true);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(cur_tid, fg_tid, false);
+            } else {
+                let _ = SetForegroundWindow(hwnd);
+            }
+            let _ = BringWindowToTop(hwnd);
+        }
+        let _ = SetFocus(Some(hwnd));
     }
 }
 
@@ -751,8 +807,7 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
-        let _ = SetForegroundWindow(hwnd);
-        let _ = BringWindowToTop(hwnd);
+        force_foreground(hwnd);
         if let Ok(list) = GetDlgItem(Some(hwnd), ID_LIST) {
             let _ = SetFocus(Some(list));
         }
@@ -761,7 +816,7 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
             let _ = GetClientRect(hwnd, &mut client);
             let _ = GetWindowRect(hwnd, &mut outer);
             log::info!(
-                "选择界面：dpi={dpi} 客户区 {}x{}，窗口 {}x{} @ ({},{})，前台窗口 {:?}，本窗口 {:?}",
+                "选择界面：dpi={dpi} 客户区 {}x{}，窗口 {}x{} @ ({},{})，前台窗口 {:?}，本窗口 {:?}，可见={}",
                 client.right - client.left,
                 client.bottom - client.top,
                 outer.right - outer.left,
@@ -769,7 +824,8 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
                 outer.left,
                 outer.top,
                 GetForegroundWindow(),
-                hwnd
+                hwnd,
+                IsWindowVisible(hwnd).as_bool()
             );
         }
         // 退出只看 CLOSED（WM_DESTROY）。这里不用 GetMessageW + WM_QUIT：
@@ -791,9 +847,19 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
             if CLOSED.load(Ordering::SeqCst) {
                 break;
             }
-            // 队列空了就阻塞等新消息，别空转
-            if WaitMessage().is_err() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            // 队列空了就等新消息（最多 100ms，留出时间轮询 Esc）
+            let wait = MsgWaitForMultipleObjectsEx(
+                None,
+                100,
+                QS_ALLINPUT,
+                MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS(0),
+            );
+            if wait == WAIT_TIMEOUT {
+                // 万一焦点被前台游戏抢走、键盘消息根本到不了这里，Esc 也能退出界面
+                if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 {
+                    log::info!("选择界面：轮询到 Esc，取消");
+                    let _ = DestroyWindow(hwnd);
+                }
             }
         }
 
