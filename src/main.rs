@@ -1,8 +1,8 @@
 mod image_animation;
 mod dxgi_capture_rs;
 mod capture_settings;
+mod image_template;
 
-#[show_image::main]
 fn main() {
-    image_animation::animation_test().unwrap();
+    image_template::animation_test().unwrap();
 }

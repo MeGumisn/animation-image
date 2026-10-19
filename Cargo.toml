@@ -2,18 +2,27 @@
 name = "animation_imagee"
 version = "0.1.0"
 edition = "2024"
+[profile.release]
+#lto = true
+#strip = true
+opt-level = 3
+panic = "abort"
+#codegen-units = 1
+debug = "none"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12",features = ["ndarray","cuda","directml"] } # ONNX Runtime 的 Rust 綁定
-ndarray = "0.17.2"
+#ort = { version = "2.0.0-rc.12", features = ["default", "ndarray","download-binaries", "directml"] } # ONNX Runtime 的 Rust 綁定
+#cudarc = { version = "0.13",features = ["cuda-12080"] }
+#ndarray = "0.17.2"
+opencv = "0.98.2"
 
 log = "0.4.29"
 # simple_logger = { version = "5.1.0",features = ["timestamps","stderr"] }
-flexi_logger = { version = "^0.31", features = ["default"] }
+#flexi_logger = { version = "^0.31", features = ["default"] }
 
-windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse","Win32_Graphics_Dwm"] }
+windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common"] }
 windows-capture = "1.5.0"
-image = "0.25.10"
-show-image = "0.14"
+#image = "0.25.10"
+#show-image = "0.14"
 
 bytes = "1.11.1"

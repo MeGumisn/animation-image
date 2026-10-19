@@ -4,6 +4,10 @@ pub struct CapturePos {
 
 // offset是游戏边框的像素值
 impl CapturePos {
+    
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> CapturePos {
+        CapturePos { rect: (x, y, w, h) }
+    }
     pub const fn key_ready(offset_x: i32, offset_y: i32) -> Self {
         Self {
             rect: (offset_x + 158, offset_y + 813, 21, 12),
@@ -43,7 +47,7 @@ impl CapturePos {
 
     pub const fn full_window() -> Self {
         Self{
-            rect: (0, 0, 1602, 980),
+            rect: (1, 58, 1600, 900),
         }
     }
 }
