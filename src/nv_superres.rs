@@ -125,7 +125,7 @@ struct Api {
     destroy_effect: FnDestroyEffect,
 }
 
-/// 运行库目录：`NVVFX_DIR` 优先，其次 NVIDIA App 的默认安装位置
+/// 运行库目录：`NVVFX_DIR` 优先，其次 exe 自带的 `nvvfx\`，最后 NVIDIA App 的默认安装位置
 fn runtime_dir() -> Result<String, String> {
     if let Some(dir) = std::env::var_os("NVVFX_DIR") {
         let dir = dir.to_string_lossy().into_owned();
@@ -134,16 +134,29 @@ fn runtime_dir() -> Result<String, String> {
         }
         return Err(format!("NVVFX_DIR 下没有 NVVideoEffects.dll：{dir}"));
     }
-    let candidates = [
-        r"C:\Program Files\NVIDIA Corporation\NVIDIA Video Effects".to_string(),
-        r"C:\Program Files (x86)\NVIDIA Corporation\NVIDIA Video Effects".to_string(),
-    ];
+    let mut candidates = Vec::new();
+    // 打包时用 package.ps1 -IncludeVfx 会把运行库放进 exe 同级的 nvvfx\
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("nvvfx").to_string_lossy().into_owned());
+            candidates.push(
+                dir.join("NVIDIA Video Effects")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    candidates.push(r"C:\Program Files\NVIDIA Corporation\NVIDIA Video Effects".to_string());
+    candidates
+        .push(r"C:\Program Files (x86)\NVIDIA Corporation\NVIDIA Video Effects".to_string());
     candidates
         .into_iter()
         .find(|dir| std::path::Path::new(dir).join("NVVideoEffects.dll").is_file())
         .ok_or_else(|| {
-            "没找到 NVIDIA Video Effects 运行库（NVVideoEffects.dll）。\
-             装 NVIDIA App 或 Maxine 运行库，或用 NVVFX_DIR 指定目录"
+            "没找到 NVIDIA Video Effects 运行库（NVVideoEffects.dll）：\n\
+             - 装 NVIDIA App（会自带该运行库），或\n\
+             - 把运行库目录放到 exe 同级的 nvvfx\\ 或 NVIDIA Video Effects\\，或\n\
+             - 用环境变量 NVVFX_DIR 指向运行库目录"
                 .to_string()
         })
 }
