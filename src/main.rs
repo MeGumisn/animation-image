@@ -4,6 +4,7 @@
 mod app_log;
 mod gpu_style;
 mod gpu_window;
+mod nv_superres;
 mod window_picker;
 
 /// 没有控制台，出错时弹个对话框：只写日志的话用户看到的就是「点了一下没反应」
@@ -79,9 +80,11 @@ fn main() {
         );
 
         // 下一轮用这次的配置作为默认值，省得每次重新填
+        defaults.mode = picked.mode;
         defaults.model_path = picked.model_path.clone();
         defaults.model_input = picked.model_input;
         defaults.output_size = picked.output_size;
+        defaults.scale = picked.scale;
 
         match gpu_window::run(&picked) {
             Ok(()) => log::info!("上屏窗口已关闭，回到选择界面"),

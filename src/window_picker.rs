@@ -27,34 +27,69 @@ const ID_IN_W: i32 = 1005;
 const ID_IN_H: i32 = 1006;
 const ID_OUT_W: i32 = 1007;
 const ID_OUT_H: i32 = 1008;
+const ID_MODE_MODEL: i32 = 1009;
+const ID_MODE_SR: i32 = 1010;
+const ID_MODE_BOTH: i32 = 1011;
+const ID_SCALE_2: i32 = 1012;
+const ID_SCALE_3: i32 = 1013;
+const ID_SCALE_4: i32 = 1014;
+
+/// 处理方式：只风格化 / 只超分 / 两者串联
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// 只跑模型推理
+    Model,
+    /// 只跑 NVIDIA 超分
+    SuperRes,
+    /// 先风格化，再超分
+    Both,
+}
+
+impl Mode {
+    pub fn has_model(self) -> bool {
+        matches!(self, Mode::Model | Mode::Both)
+    }
+    pub fn has_super_res(self) -> bool {
+        matches!(self, Mode::SuperRes | Mode::Both)
+    }
+}
 
 /// 一次运行需要的全部参数
 #[derive(Clone, Debug)]
 pub struct Picked {
     pub hwnd: HWND,
     pub title: String,
-    /// 模型文件路径
+    pub mode: Mode,
+    /// 模型文件路径（`mode` 不含模型时可以为空）
     pub model_path: String,
     /// 模型输入宽高；`None` = 与所选窗口客户区一致
     pub model_input: Option<(u32, u32)>,
-    /// 上屏窗口宽高；`None` = 与所选窗口客户区一致
+    /// 上屏尺寸。
+    /// - 不含超分：就是上屏窗口客户区尺寸，`None` = 跟随所选窗口
+    /// - 含超分：是**超分输入**尺寸，最终展示尺寸 = 它 × `scale`
     pub output_size: Option<(u32, u32)>,
+    /// NVIDIA 超分倍率（2/3/4）
+    pub scale: u32,
 }
 
 /// 界面上各输入框的默认值
 #[derive(Clone, Debug)]
 pub struct Defaults {
+    pub mode: Mode,
     pub model_path: String,
     pub model_input: Option<(u32, u32)>,
     pub output_size: Option<(u32, u32)>,
+    pub scale: u32,
 }
 
 impl Default for Defaults {
     fn default() -> Self {
         Self {
+            mode: Mode::Model,
             model_path: "AnimeGANv3_Hayao_36.onnx".to_string(),
             model_input: None,
             output_size: None,
+            scale: 2,
         }
     }
 }
@@ -63,9 +98,11 @@ impl Default for Defaults {
 struct Confirmed {
     hwnd: isize,
     title: String,
+    mode: Mode,
     model_path: String,
     model_input: Option<(u32, u32)>,
     output_size: Option<(u32, u32)>,
+    scale: u32,
 }
 
 static CONFIRMED: Mutex<Option<Confirmed>> = Mutex::new(None);
@@ -239,12 +276,26 @@ unsafe fn accept(hwnd: HWND) {
             reject(hwnd, "这一项没有窗口句柄，换一个");
             return;
         }
+        let mode = if radio_on(hwnd, ID_MODE_SR) {
+            Mode::SuperRes
+        } else if radio_on(hwnd, ID_MODE_BOTH) {
+            Mode::Both
+        } else {
+            Mode::Model
+        };
+        let scale = if radio_on(hwnd, ID_SCALE_4) {
+            4
+        } else if radio_on(hwnd, ID_SCALE_3) {
+            3
+        } else {
+            2
+        };
         let model = text_of(hwnd, ID_MODEL).trim().to_string();
-        if model.is_empty() {
-            reject(hwnd, "请填写模型文件路径");
+        if mode.has_model() && model.is_empty() {
+            reject(hwnd, "该模式需要模型文件，请填写路径（只超分可以留空）");
             return;
         }
-        if !std::path::Path::new(&model).is_file() {
+        if mode.has_model() && !std::path::Path::new(&model).is_file() {
             // 相对路径是相对「当前工作目录」解析的，顺便把它打出来
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -267,20 +318,53 @@ unsafe fn accept(hwnd: HWND) {
                 return;
             }
         };
+        if mode.has_super_res() {
+            if let Some((w, h)) = output_size {
+                if w * scale > 16384 || h * scale > 16384 {
+                    reject(
+                        hwnd,
+                        &format!(
+                            "超分后尺寸 {}x{} 超出上限 16384，请把上屏宽高调小或降低倍率",
+                            w * scale,
+                            h * scale
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
         let target = HWND(target as *mut core::ffi::c_void);
         let title = window_title_of(target);
         log::info!(
-            "选择界面：确认 hwnd={:?}「{title}」模型={model} 输入={model_input:?} 上屏={output_size:?}",
+            "选择界面：确认 hwnd={:?}「{title}」模式={mode:?} 倍率={scale}x 模型={model} 输入={model_input:?} 上屏={output_size:?}",
             target
         );
         *confirmed_slot() = Some(Confirmed {
             hwnd: target.0 as isize,
             title,
+            mode,
             model_path: model,
             model_input,
             output_size,
+            scale,
         });
         let _ = DestroyWindow(hwnd);
+    }
+}
+
+unsafe fn set_radio(parent: HWND, id: i32, on: bool) {
+    unsafe {
+        if let Ok(ctrl) = GetDlgItem(Some(parent), id) {
+            let _ = SendMessageW(ctrl, BM_SETCHECK, Some(WPARAM(usize::from(on))), None);
+        }
+    }
+}
+
+unsafe fn radio_on(parent: HWND, id: i32) -> bool {
+    unsafe {
+        GetDlgItem(Some(parent), id)
+            .map(|ctrl| SendMessageW(ctrl, BM_GETCHECK, None, None).0 != 0)
+            .unwrap_or(false)
     }
 }
 
@@ -515,11 +599,11 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 make_child(
                     hwnd,
                     "STATIC",
-                    "④ 上屏宽高（留空 = 与所选窗口一致）",
+                    "④ 上屏宽高（超分时=超分输入尺寸，最终=它×倍率；留空=自动）",
                     (WS_CHILD | WS_VISIBLE).0,
                     s(12),
                     s(410),
-                    s(300),
+                    s(560),
                     s(18),
                     -1,
                 );
@@ -561,14 +645,101 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     ID_OUT_H,
                 );
 
-                // ⑤ 状态行（上一次的错误会显示在这里）
+                // ⑤ 处理方式（三选一）
+                make_child(
+                    hwnd,
+                    "STATIC",
+                    "⑤ 处理方式",
+                    (WS_CHILD | WS_VISIBLE).0,
+                    s(12),
+                    s(444),
+                    s(150),
+                    s(18),
+                    -1,
+                );
+                let radio = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+                make_child(
+                    hwnd,
+                    "BUTTON",
+                    "仅模型（风格化）",
+                    (radio | WS_GROUP | WINDOW_STYLE(BS_AUTORADIOBUTTON as u32)).0,
+                    s(180),
+                    s(440),
+                    s(150),
+                    s(24),
+                    ID_MODE_MODEL,
+                );
+                make_child(
+                    hwnd,
+                    "BUTTON",
+                    "仅超分（NVIDIA）",
+                    (radio | WINDOW_STYLE(BS_AUTORADIOBUTTON as u32)).0,
+                    s(330),
+                    s(440),
+                    s(150),
+                    s(24),
+                    ID_MODE_SR,
+                );
+                make_child(
+                    hwnd,
+                    "BUTTON",
+                    "模型 + 超分",
+                    (radio | WINDOW_STYLE(BS_AUTORADIOBUTTON as u32)).0,
+                    s(480),
+                    s(440),
+                    s(150),
+                    s(24),
+                    ID_MODE_BOTH,
+                );
+
+                // ⑥ 超分倍率（仅超分 / 模型+超分 时生效）
+                make_child(
+                    hwnd,
+                    "STATIC",
+                    "⑥ 超分倍率",
+                    (WS_CHILD | WS_VISIBLE).0,
+                    s(12),
+                    s(474),
+                    s(150),
+                    s(18),
+                    -1,
+                );
+                for (i, (label, id)) in [
+                    ("2x", ID_SCALE_2),
+                    ("3x", ID_SCALE_3),
+                    ("4x", ID_SCALE_4),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let first = if i == 0 { WS_GROUP } else { WINDOW_STYLE(0) };
+                    make_child(
+                        hwnd,
+                        "BUTTON",
+                        label,
+                        (radio | first | WINDOW_STYLE(BS_AUTORADIOBUTTON as u32)).0,
+                        s(180 + i as i32 * 70),
+                        s(470),
+                        s(60),
+                        s(24),
+                        id,
+                    );
+                }
+                set_radio(hwnd, ID_MODE_MODEL, defaults.mode == Mode::Model);
+                set_radio(hwnd, ID_MODE_SR, defaults.mode == Mode::SuperRes);
+                set_radio(hwnd, ID_MODE_BOTH, defaults.mode == Mode::Both);
+                set_radio(hwnd, ID_SCALE_2, defaults.scale == 2);
+                set_radio(hwnd, ID_SCALE_3, defaults.scale == 3);
+                set_radio(hwnd, ID_SCALE_4, defaults.scale == 4);
+
+                // ⑦ 状态行（上一次的错误会显示在这里）
                 make_child(
                     hwnd,
                     "STATIC",
                     "",
                     (WS_CHILD | WS_VISIBLE).0,
                     s(12),
-                    s(444),
+                    s(500),
                     s(560),
                     s(36),
                     ID_OK + 100,
@@ -580,7 +751,7 @@ extern "system" fn picker_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     "开始渲染",
                     (WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32)).0,
                     s(596),
-                    s(444),
+                    s(500),
                     s(116),
                     s(34),
                     ID_OK,
@@ -762,7 +933,7 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
         PICKER_DPI.store(dpi, Ordering::SeqCst);
         let scale = dpi as f32 / 96.0;
         let client_w = (726.0 * scale) as i32;
-        let client_h = (490.0 * scale) as i32;
+        let client_h = (548.0 * scale) as i32;
         let style = WS_OVERLAPPEDWINDOW & !WS_THICKFRAME & !WS_MAXIMIZEBOX;
         let mut outer = RECT {
             left: 0,
@@ -871,9 +1042,11 @@ pub fn pick(defaults: &Defaults) -> Result<Option<Picked>, String> {
         Ok(Some(Picked {
             hwnd: HWND(c.hwnd as *mut core::ffi::c_void),
             title: c.title,
+            mode: c.mode,
             model_path: c.model_path,
             model_input: c.model_input,
             output_size: c.output_size,
+            scale: c.scale,
         }))
     }
 }

@@ -6,7 +6,8 @@
 //! 整条链路里 CPU 只做三件事：提交 CS、等待围栏、Present(1)。
 //! 没有 `Map`、没有 `memcpy`、没有 OpenCV 窗口重绘，因此不会出现 CPU 版那种「一顿一顿」的观感。
 
-use crate::gpu_style::GpuStylePipeline;
+use crate::gpu_style::{create_standalone_device, GpuBlit, GpuStylePipeline};
+use crate::nv_superres::SuperRes;
 use crate::window_picker::Picked;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{Interface, PCWSTR};
@@ -20,7 +21,6 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, UpdateWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 上屏窗口标题
@@ -48,7 +48,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
 }
 
-/// 退出时（Esc / 点 X / 中途出错）一定把上屏窗口关掉，否则会留下一个没人管的窗口
+/// 退出时（点 X / 中途出错）一定把上屏窗口关掉，否则会留下一个没人管的窗口
 struct DisplayWindow(HWND);
 
 impl Drop for DisplayWindow {
@@ -293,6 +293,10 @@ struct WindowCapture {
     // 持有 session / item 才会持续推帧，别被 drop
     _session: windows::Graphics::Capture::GraphicsCaptureSession,
     _item: windows::Graphics::Capture::GraphicsCaptureItem,
+    /// 帧池绑定的 WinRT 设备：Recreate 时必须原样传回，所以得自己存着
+    rt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
+    /// 帧池当前分配的尺寸（窗口改尺寸后要按新尺寸重建，否则纹理还是旧的）
+    pool_size: (i32, i32),
     game: HWND,
 }
 
@@ -344,14 +348,39 @@ impl WindowCapture {
                 pool,
                 _session: session,
                 _item: item,
+                rt_device,
+                pool_size: (size.Width, size.Height),
                 game: hwnd,
             })
         }
     }
 
     fn with_frame(&mut self, f: &mut FrameFn<'_>) -> Result<bool, String> {
+        use windows::Graphics::DirectX::DirectXPixelFormat;
         use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
         unsafe {
+            // 窗口改尺寸后帧池里还是旧尺寸的纹理（ContentSize 会变，但纹理本身不跟着变），
+            // 必须按新尺寸重建一次；重建只保留池对象本身，session 继续用，不用重建。
+            if let Ok(item_size) = self._item.Size() {
+                let (w, h) = (item_size.Width, item_size.Height);
+                // 最小化时 item 尺寸可能是 0，跳过；连续改尺寸时只在尺寸真正变了才重建
+                if w > 0 && h > 0 && (w, h) != self.pool_size {
+                    match self.pool.Recreate(
+                        &self.rt_device,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        item_size,
+                    ) {
+                        Ok(()) => {
+                            log::info!("采集帧池按窗口新尺寸重建：{}x{} → {}x{}", self.pool_size.0, self.pool_size.1, w, h);
+                            self.pool_size = (w, h);
+                            // 刚重建的池是空的，这一轮先不出图，下轮就有帧了
+                            return Ok(false);
+                        }
+                        Err(e) => eprintln!("帧池重建失败（继续用旧尺寸）: {e}"),
+                    }
+                }
+            }
             // 没有新帧时这里会返回错误/空指针，正常情况，不算失败
             let frame = match self.pool.TryGetNextFrame() {
                 Ok(frame) => frame,
@@ -651,30 +680,43 @@ pub fn run(picked: &Picked) -> Result<(), String> {
         picked.title.clone()
     };
 
-    // 2) 模型输入：界面里填了就优先用用户填的（固定输入尺寸的模型必须原样）；
-    //    没填就直接用目标窗口客户区的宽高
+    // 2) 尺寸链：模型输入 → 风格化（等尺寸）→ 缩放到「超分输入」→ ×倍率 = 最终展示尺寸。
+    //    超分之后不再缩放，上屏窗口客户区就是最终尺寸。
+    let has_model = picked.mode.has_model();
+    let has_sr = picked.mode.has_super_res();
+    let scale = picked.scale.clamp(2, 4);
+
+    // 模型输入：界面里填了就优先用（固定输入尺寸的模型必须原样），否则取目标客户区
     let (infer_w, infer_h) = match picked.model_input {
         Some(size) => size,
         None => (align8(client_w), align8(client_h)),
     };
+    // 超分输入尺寸（= 模型输出要缩放到的尺寸）：界面④ 填了就用，否则跟随模型/窗口
+    let sr_in = picked.output_size.unwrap_or(if has_model {
+        (infer_w, infer_h)
+    } else {
+        (align8(client_w), align8(client_h))
+    });
+    // 最终展示尺寸：含超分时严格 = 超分输入 × 倍率
+    let (final_w, final_h) = if has_sr {
+        (sr_in.0 * scale, sr_in.1 * scale)
+    } else {
+        picked.output_size.unwrap_or((client_w, client_h))
+    };
     log::info!(
-        "上屏开始：目标窗口「{game_title}」客户区 {client_w}x{client_h}，模型 {}，请求输入 {infer_w}x{infer_h}（{}）",
-        picked.model_path,
-        if picked.model_input.is_some() {
-            "界面填写"
-        } else {
-            "留空，取目标窗口客户区尺寸"
-        }
+        "上屏开始：目标窗口「{game_title}」客户区 {client_w}x{client_h}，模式 {:?}，模型输入 {infer_w}x{infer_h}，超分输入 {}x{} ×{scale} → 上屏 {final_w}x{final_h}",
+        picked.mode,
+        sr_in.0,
+        sr_in.1
     );
 
     // 3) 先建结果窗口：点「开始渲染」后马上有反馈，加载模型/预热期间不会一片空白
-    let follow_game = picked.output_size.is_none();
-    let (out_w, out_h) = picked.output_size.unwrap_or((client_w, client_h));
+    let follow_game = !has_sr && picked.output_size.is_none();
     CLOSED.store(false, Ordering::SeqCst);
     let hwnd = create_window(
         "AnimeGAN GPU Passthrough（正在初始化…）",
-        out_w.max(2) as i32,
-        out_h.max(2) as i32,
+        final_w.max(2) as i32,
+        final_h.max(2) as i32,
     )?;
     // 之后任何 return（含 ? 早期出错）都会把窗口关掉，不留幽灵窗口
     let _display = DisplayWindow(hwnd);
@@ -682,15 +724,29 @@ pub fn run(picked: &Picked) -> Result<(), String> {
         let (w, h) = window_client_size(hwnd);
         (w.max(2), h.max(2))
     };
-    log::info!("上屏：显示窗口 {disp_w}x{disp_h} 已创建，开始加载模型");
+    log::info!("上屏：显示窗口 {disp_w}x{disp_h} 已创建");
 
-    let mut pipeline = GpuStylePipeline::new(&picked.model_path, infer_w, infer_h)?;
-    log::info!(
-        "上屏：模型管线就绪（实际输入 {}x{}，模型固定尺寸时以模型为准），创建交换链",
-        pipeline.width,
-        pipeline.height
-    );
-    let mut swap = Swapchain::new(pipeline.device11(), hwnd, disp_w, disp_h)?;
+    // 4) 模型管线（可选）：只用超分时完全不碰 ONNX/DirectML
+    let mut pipeline = if has_model {
+        log::info!("上屏：加载模型 {}", picked.model_path);
+        Some(GpuStylePipeline::new(&picked.model_path, infer_w, infer_h)?)
+    } else {
+        None
+    };
+    // 设备：有模型就用 DML 管线自己的（同一块卡），否则单独建一个 D3D11 设备
+    let device11 = match &pipeline {
+        Some(p) => p.device11().clone(),
+        None => create_standalone_device()?.0,
+    };
+    let ctx11 = unsafe { device11.GetImmediateContext() }
+        .map_err(|e| format!("GetImmediateContext: {e}"))?;
+    // 纹理中转（读回/上传/上屏）：只有超分模式需要
+    let mut blit = if has_sr {
+        Some(GpuBlit::new(&device11, &ctx11)?)
+    } else {
+        None
+    };
+    let mut swap = Swapchain::new(&device11, hwnd, disp_w, disp_h)?;
     unsafe {
         let title = wide(DISPLAY_TITLE);
         let _ = SetWindowTextW(hwnd, PCWSTR::from_raw(title.as_ptr()));
@@ -698,38 +754,66 @@ pub fn run(picked: &Picked) -> Result<(), String> {
 
     // 只做按窗口采集（WGC）。拿不到就直接失败退出，不去做桌面复制兜底
     log::info!("上屏：初始化采集（WGC）");
-    let mut capture = WindowCapture::new(pipeline.device11(), game).map_err(|e| {
+    let mut capture = WindowCapture::new(&device11, game).map_err(|e| {
         format!(
             "按窗口采集（WGC）不可用：{e}\n\n这个程序只做直通上屏，不支持时不会退回桌面复制。\n\
              需要 Windows 10 1809 及以上，并且目标窗口不能有跨进程的内容保护。"
         )
     })?;
-    // WGC 给的是窗口自己的 SDR 画面（和游戏原始输出一致），不做任何色彩转换
-    pipeline.set_sdr_white_scale(1.0);
+    if pipeline.is_some() {
+        // WGC 给的是窗口自己的 SDR 画面（和游戏原始输出一致），不做任何色彩转换
+        pipeline.as_mut().unwrap().set_sdr_white_scale(1.0);
+    }
     log::info!("上屏：采集方式 = 按窗口（WGC），跟随窗口尺寸/位置变化，被遮挡也能采");
 
-    // 跟随游戏窗口尺寸：客户区一变就把结果窗口改成同样大小
+    // 5) 超分引擎 + 中转纹理
+    let mut sr = if has_sr {
+        log::info!("上屏：初始化 NVIDIA 超分（{scale}x）");
+        Some(SuperRes::new(scale)?)
+    } else {
+        None
+    };
+    // 模型输出 → 缩放后的图像（尺寸 = 超分输入）
+    let (mid_tex, mid_rtv) = if has_sr {
+        let b = blit.as_ref().ok_or("blit 未初始化")?;
+        let (t, r) = b.create_target(sr_in.0, sr_in.1)?;
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
+    // 超分结果（尺寸 = 最终展示尺寸）
+    let final_tex = match (&blit, has_sr) {
+        (Some(b), true) => Some(b.create_target(final_w, final_h)?.0),
+        _ => None,
+    };
+    // 仅超分模式：先把采样纹理的客户区抠出来（尺寸随目标窗口客户区变化）
+    let mut crop: Option<(ID3D11Texture2D, u32, u32)> = None;
+
+    // 跟随游戏窗口尺寸：客户区一变就把结果窗口改成同样大小（超分模式固定尺寸，不跟随）
     let mut game_client = (
         (client.right - client.left).max(0),
         (client.bottom - client.top).max(0),
     );
 
     // 预热：DirectML 首次运行会编译算子（~1s），先跑一帧把编译成本移出主循环
-    log::info!("上屏：预热 DirectML（首次编译算子，可能几秒）");
-    let dummy = DummyTexture::new(pipeline.device11())?;
-    for _ in 0..2 {
-        // 用 dummy 自己的尺寸，避免触发「裁剪区域越界」的提示
-        pipeline.upload_texture(dummy.as_texture(), 0, 0, 16, 16)?;
-        pipeline.infer()?;
+    if let Some(p) = pipeline.as_mut() {
+        log::info!("上屏：预热 DirectML（首次编译算子，可能几秒）");
+        let dummy = DummyTexture::new(&device11)?;
+        for _ in 0..2 {
+            // 用 dummy 自己的尺寸，避免触发「裁剪区域越界」的提示
+            p.upload_texture(dummy.as_texture(), 0, 0, 16, 16)?;
+            p.infer()?;
+        }
     }
-    log::info!("上屏：预热完成，进入主循环（按 Esc 或关闭窗口退出）");
+    log::info!("上屏：预热完成，进入主循环（关闭上屏窗口退出）");
 
     let mut frames = 0u64;
     let mut last_report = std::time::Instant::now();
     let mut infer_ms_sum = 0.0f32;
 
     'main: loop {
-        // 1) 消息泵：退出只认「上屏窗口被关」或 Esc，残留的 WM_QUIT 一律丢掉
+        // 1) 消息泵：退出只认「上屏窗口被关」，残留的 WM_QUIT 一律丢掉。
+        //    Esc 不再作为退出方式（键盘状态轮询会误伤游戏里的按键）。
         unsafe {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -740,9 +824,6 @@ pub fn run(picked: &Picked) -> Result<(), String> {
                 DispatchMessageW(&msg);
             }
             if CLOSED.load(Ordering::SeqCst) {
-                break 'main;
-            }
-            if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 {
                 break 'main;
             }
         }
@@ -761,19 +842,76 @@ pub fn run(picked: &Picked) -> Result<(), String> {
         }
 
         // 3) 取最新一帧（没有新帧就复用上一帧结果，保证刷新节奏稳定）
+        let mut captured: Option<Vec<u8>> = None;
         let got_frame = {
-            let mut upload = |tex: &ID3D11Texture2D, l: u32, t: u32, w: u32, h: u32| {
-                pipeline.upload_texture(tex, l, t, w, h)?;
-                // 必须在帧对象释放之前确保 CS 已读完这张纹理
-                pipeline.sync()
-            };
+            let mut upload =
+                |tex: &ID3D11Texture2D, l: u32, t: u32, w: u32, h: u32| -> Result<(), String> {
+                    match pipeline.as_mut() {
+                        Some(p) => {
+                            p.upload_texture(tex, l, t, w, h)?;
+                            // 必须在帧对象释放之前确保 CS 已读完这张纹理
+                            p.sync()
+                        }
+                        None => {
+                            // 仅超分：抠出客户区 → GPU 缩放到超分输入尺寸 → 读回 CPU
+                            let b = blit.as_mut().ok_or("blit 未初始化")?;
+                            if crop.as_ref().map(|(_, cw, ch)| (*cw, *ch)) != Some((w, h)) {
+                                crop = Some((b.create_target(w.max(2), h.max(2))?.0, w, h));
+                            }
+                            let (ct, cw, ch) = crop.as_ref().ok_or("裁剪纹理未就绪")?;
+                            let (cw, ch) = (*cw, *ch);
+                            b.copy_region(ct, tex, l, t, cw, ch)?;
+                            b.draw_texture(
+                                ct,
+                                mid_rtv.as_ref().ok_or("中转 RTV 未就绪")?,
+                                cw,
+                                ch,
+                                sr_in.0,
+                                sr_in.1,
+                            )?;
+                            captured = Some(b.read_bgra(
+                                mid_tex.as_ref().ok_or("中转纹理未就绪")?,
+                                sr_in.0,
+                                sr_in.1,
+                            )?);
+                            Ok(())
+                        }
+                    }
+                };
             capture.with_frame(&mut upload)?
         };
 
-        // 4) 有新帧才推理（推理内部已包含显存同步），否则直接复用上一帧结果
+        // 4) 有新帧才走推理 / 超分，否则直接复用上一帧的画面
         if got_frame {
             let started = std::time::Instant::now();
-            pipeline.infer()?;
+            if has_model {
+                pipeline.as_mut().ok_or("模型管线未初始化")?.infer()?;
+            }
+            if has_sr {
+                // 「模型 + 超分」：模型输出先按 Catmull-Rom 缩放到超分输入尺寸再读回；
+                // 「仅超分」：上面的 upload 里已经准备好了同一尺寸的 BGRA
+                let data = match captured.take() {
+                    Some(d) => d,
+                    None => {
+                        let p = pipeline.as_mut().ok_or("模型管线未初始化")?;
+                        p.present(
+                            mid_rtv.as_ref().ok_or("中转 RTV 未就绪")?,
+                            sr_in.0,
+                            sr_in.1,
+                        )?;
+                        blit.as_mut()
+                            .ok_or("blit 未初始化")?
+                            .read_bgra(mid_tex.as_ref().ok_or("中转纹理未就绪")?, sr_in.0, sr_in.1)?
+                    }
+                };
+                let (out, ow, oh) = sr
+                    .as_mut()
+                    .ok_or("超分引擎未初始化")?
+                    .run_bgra(&data, sr_in.0, sr_in.1)?;
+                blit.as_mut()
+                    .ok_or("blit 未初始化")?
+                    .upload_bgra(final_tex.as_ref().ok_or("超分结果纹理未就绪")?, &out, ow, oh)?;
+            }
             infer_ms_sum += started.elapsed().as_secs_f32() * 1000.0;
             frames += 1;
         }
@@ -782,7 +920,7 @@ pub fn run(picked: &Picked) -> Result<(), String> {
         {
             let (w, h) = window_client_size(hwnd);
             if w > 0 && h > 0 {
-                if let Err(e) = swap.resize(pipeline.device11(), w, h) {
+                if let Err(e) = swap.resize(&device11, w, h) {
                     eprintln!("重建后缓冲失败: {e}");
                 }
             }
@@ -790,7 +928,22 @@ pub fn run(picked: &Picked) -> Result<(), String> {
 
         // 6) 每帧都上屏 + 垂直同步，避免画面跳变
         let rtv = swap.rtv.as_ref().ok_or("渲染目标未就绪")?;
-        pipeline.present(rtv, swap.width, swap.height)?;
+        match (pipeline.as_mut(), has_sr) {
+            // 仅模型：模型输出直接铺满后缓冲
+            (Some(p), false) => p.present(rtv, swap.width, swap.height)?,
+            // 含超分：超分结果 1:1 上屏（只有窗口被手动改动尺寸时才会缩放）
+            (_, true) => {
+                blit.as_mut().ok_or("blit 未初始化")?.draw_texture(
+                    final_tex.as_ref().ok_or("超分结果纹理未就绪")?,
+                    rtv,
+                    final_w,
+                    final_h,
+                    swap.width,
+                    swap.height,
+                )?;
+            }
+            _ => {}
+        }
         unsafe {
             let hr = swap.swap.Present(1, DXGI_PRESENT(0));
             if hr.is_err() {
@@ -801,7 +954,7 @@ pub fn run(picked: &Picked) -> Result<(), String> {
         if last_report.elapsed().as_secs_f32() >= 1.0 {
             let fps = frames as f32 / last_report.elapsed().as_secs_f32();
             let avg = if frames > 0 { infer_ms_sum / frames as f32 } else { 0.0 };
-            eprintln!("fps≈{fps:.1} | 单帧推理+搬运 {avg:.1}ms");
+            eprintln!("fps≈{fps:.1} | 单帧处理 {avg:.1}ms");
             frames = 0;
             infer_ms_sum = 0.0;
             last_report = std::time::Instant::now();

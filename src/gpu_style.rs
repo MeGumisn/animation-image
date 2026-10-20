@@ -28,7 +28,6 @@ use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, Memory
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{IoBinding, Session};
 use ort::value::{Shape, Tensor, ValueType};
-use windows::core::{Interface, PCSTR};
 use windows::Win32::Foundation::{HANDLE, HMODULE, LUID, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
@@ -37,9 +36,13 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::core::{Interface, PCSTR};
 
 /// ort 采用 `load-dynamic`：运行时加载自带的 DirectML 版 onnxruntime.dll。
 /// 全局只初始化一次；优先用 ORT_DYLIB_PATH，其次 libs/ 与 exe 同目录。
@@ -116,10 +119,12 @@ fn f16_to_f32(h: u16) -> f32 {
 const CS_SRC: &str = r#"
 Texture2D<float4> srcTex : register(t0);
 RWBuffer<float> dstBuf : register(u0);
+// 原图亮度（0..1 sRGB 域）：模型输出会提亮暗部，上屏时用它把亮度锚回原图
+RWBuffer<float> lumaBuf : register(u1);
 cbuffer Params : register(b0) {
     uint srcLeft; uint srcTop; uint srcW; uint srcH;
     uint dstW; uint dstH; uint texW; uint texH;
-    uint toSrgb; uint pad0; float hdrScale; float pad1;
+    uint toSrgb; uint exact; float hdrScale; float lumaAnchor;
 };
 
 // HDR（scRGB/FP16）桌面复制给的是线性值，需要编码回 sRGB
@@ -167,6 +172,8 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     dstBuf[idx + 0u] = saturate(c.r) * 2.0 - 1.0; // R
     dstBuf[idx + 1u] = saturate(c.g) * 2.0 - 1.0; // G
     dstBuf[idx + 2u] = saturate(c.b) * 2.0 - 1.0; // B
+    // 顺手记下原图亮度：风格化模型的输出会整体提亮暗部，上屏时按它拉回来
+    lumaBuf[id.y * dstW + id.x] = dot(saturate(c), float3(0.299, 0.587, 0.114));
 }
 "#;
 
@@ -174,7 +181,7 @@ const VS_SRC: &str = r#"
 cbuffer Params : register(b0) {
     uint srcLeft; uint srcTop; uint srcW; uint srcH;
     uint dstW; uint dstH; uint texW; uint texH;
-    uint toSrgb; uint pad0; float hdrScale; float pad1;
+    uint toSrgb; uint exact; float hdrScale; float lumaAnchor;
 };
 struct VSOut { float4 pos : SV_Position; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -188,11 +195,31 @@ VSOut VSMain(uint vid : SV_VertexID) {
 /// 直接把推理结果画到后缓冲：Catmull-Rom 双三次放大，比最近邻/双线性锐利得多
 const PS_SRC: &str = r#"
 Buffer<float> srcBuf : register(t0);
+// 原图亮度（由 CS 在送进模型时顺带写下）
+Buffer<float> lumaBuf : register(t1);
 cbuffer Params : register(b0) {
     uint srcLeft; uint srcTop; uint srcW; uint srcH;
     uint dstW; uint dstH; uint texW; uint texH;
-    uint toSrgb; uint pad0; float hdrScale; float pad1;
+    uint toSrgb; uint exact; float hdrScale; float lumaAnchor;
 };
+
+/// 亮度锚定：保留模型输出的色度比例，把亮度往原图拉
+///   lumaAnchor = 1 → 完全用模型亮度（原始行为）
+///   lumaAnchor = 0 → 亮度完全等于原图，模型只贡献颜色
+float3 anchor_luma(float3 c01, float yOrig) {
+    c01 = saturate(c01);
+    float ym = dot(c01, float3(0.299, 0.587, 0.114));
+    if (ym > 1e-4) {
+        float yNew = yOrig + lumaAnchor * (ym - yOrig);
+        c01 = saturate(c01 * (yNew / ym));
+    }
+    return c01;
+}
+
+float fetch_luma(int2 p) {
+    p = clamp(p, int2(0, 0), int2((int)srcW - 1, (int)srcH - 1));
+    return lumaBuf[(uint)p.y * srcW + (uint)p.x];
+}
 
 float3 fetch(int2 p) {
     p = clamp(p, int2(0, 0), int2((int)srcW - 1, (int)srcH - 1));
@@ -210,6 +237,13 @@ void cr_weights(float t, out float w0, out float w1, out float w2, out float w3)
 }
 
 float4 PSMain(float4 pos : SV_Position) : SV_Target {
+    // 目标尺寸与源一致时直通：Catmull-Rom 在 t=0.5 是个轻微低通，1:1 也套它平白丢锐度
+    if (exact != 0u) {
+        int2 ip = int2(pos.xy);
+        uint idx = ((uint)ip.y * srcW + (uint)ip.x) * 3u;
+        float3 c01 = float3(srcBuf[idx], srcBuf[idx + 1u], srcBuf[idx + 2u]) * 0.5 + 0.5;
+        return float4(anchor_luma(c01, fetch_luma(ip)), 1.0);
+    }
     float2 p = pos.xy * float2(srcW, srcH) / float2(dstW, dstH) - 0.5;
     int2 base = (int2)floor(p);
     float2 f = p - (float2)base;
@@ -227,7 +261,26 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     }
     // 模型输出是 tanh 的 [-1,1]，必须先映射回 [0,1]（c * 0.5 + 0.5）再上屏；
     // 直接 saturate 会把所有负值压成 0、正值砍半，整幅画面变成高对比死黑。
-    return float4(saturate(c * 0.5 + 0.5), 1.0);
+    return float4(anchor_luma(c * 0.5 + 0.5, fetch_luma(base)), 1.0);
+}
+"#;
+
+/// 纹理 → 后缓冲：超分结果是现成的 BGRA 纹理，1:1 时直通，否则线性放大
+const PS_TEX_SRC: &str = r#"
+Texture2D<float4> srcTex : register(t0);
+SamplerState linClamp : register(s0);
+cbuffer Params : register(b0) {
+    uint srcLeft; uint srcTop; uint srcW; uint srcH;
+    uint dstW; uint dstH; uint texW; uint texH;
+    uint toSrgb; uint exact; float hdrScale; float lumaAnchor;
+};
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target {
+    if (exact != 0u) {
+        return float4(saturate(srcTex.Load(int3(int2(pos.xy), 0)).rgb), 1.0);
+    }
+    float2 uv = pos.xy / float2(dstW, dstH);
+    return float4(saturate(srcTex.SampleLevel(linClamp, uv, 0).rgb), 1.0);
 }
 "#;
 
@@ -245,10 +298,25 @@ struct Params {
     tex_h: u32,
     /// 1 = 源纹理是线性值（HDR scRGB），需要编码回 sRGB
     to_srgb: u32,
-    _pad0: u32,
+    /// 1 = 源与目标同尺寸，采样时直通（不做 Catmull-Rom 低通）
+    exact: u32,
     /// HDR 下把 scRGB 线性值归一化到「SDR 白 = 1.0」的乘数（80 / SDRWhiteLevelNits）
     hdr_scale: f32,
-    _pad1: f32,
+    /// 亮度锚定强度：1 = 完全用模型亮度，0 = 亮度完全跟原图
+    luma_anchor: f32,
+}
+
+/// 亮度锚定强度默认值。实测 AnimeGANv3 输出暗部比原图亮 ~10/255、亮部暗 ~13/255，
+/// 这里把差值按比例保留一部分：0 = 亮度完全跟原图，1 = 完全跟模型（原始行为）。
+const LUMA_ANCHOR: f32 = 0.3;
+
+/// 允许用环境变量 `LUMA_ANCHOR` 覆盖（0..1），免得为了调这个值重新编译
+fn luma_anchor() -> f32 {
+    std::env::var("LUMA_ANCHOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(LUMA_ANCHOR)
 }
 
 fn shader_blob(src: &str, entry: &[u8], target: &[u8]) -> Result<ID3DBlob, String> {
@@ -472,6 +540,9 @@ pub struct GpuStylePipeline {
     output: SharedBuffer,
     uav_in: ID3D11UnorderedAccessView,
     srv_out: ID3D11ShaderResourceView,
+    /// 原图亮度（CS 写 / 上屏 PS 读），用于把模型提亮的暗部拉回原图
+    uav_luma: ID3D11UnorderedAccessView,
+    srv_luma: ID3D11ShaderResourceView,
     cb: ID3D11Buffer,
     cs: ID3D11ComputeShader,
     vs: ID3D11VertexShader,
@@ -637,6 +708,67 @@ impl GpuStylePipeline {
                 .map_err(|e| format!("CreateShaderResourceView: {e}"))?;
         }
 
+        // 原图亮度缓冲：CS 送进模型时顺手写，上屏 PS 用它把亮度锚回原图
+        let mut luma: Option<ID3D11Buffer> = None;
+        unsafe {
+            device11
+                .CreateBuffer(
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: width * height * 4,
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: (D3D11_BIND_UNORDERED_ACCESS.0
+                            | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                        CPUAccessFlags: 0,
+                        MiscFlags: 0,
+                        StructureByteStride: 0,
+                    },
+                    None,
+                    Some(&mut luma),
+                )
+                .map_err(|e| format!("创建亮度缓冲失败: {e}"))?;
+        }
+        let luma = luma.ok_or("亮度缓冲创建失败")?;
+        let luma_elems = width * height;
+        let mut luma_uav: Option<ID3D11UnorderedAccessView> = None;
+        let mut luma_srv: Option<ID3D11ShaderResourceView> = None;
+        unsafe {
+            device11
+                .CreateUnorderedAccessView(
+                    &luma,
+                    Some(&D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_FLOAT,
+                        ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D11_BUFFER_UAV {
+                                FirstElement: 0,
+                                NumElements: luma_elems,
+                                Flags: 0,
+                            },
+                        },
+                    }),
+                    Some(&mut luma_uav),
+                )
+                .map_err(|e| format!("亮度缓冲 UAV: {e}"))?;
+            device11
+                .CreateShaderResourceView(
+                    &luma,
+                    Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_FLOAT,
+                        ViewDimension: D3D_SRV_DIMENSION_BUFFER,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D11_BUFFER_SRV {
+                                Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
+                                Anonymous2: D3D11_BUFFER_SRV_1 {
+                                    NumElements: luma_elems,
+                                },
+                            },
+                        },
+                    }),
+                    Some(&mut luma_srv),
+                )
+                .map_err(|e| format!("亮度缓冲 SRV: {e}"))?;
+        }
+
         // 4) 着色器 + 常量缓冲
         let cs_blob = shader_blob(CS_SRC, b"CSMain\0", b"cs_5_0\0")?;
         let vs_blob = shader_blob(VS_SRC, b"VSMain\0", b"vs_5_0\0")?;
@@ -701,6 +833,8 @@ impl GpuStylePipeline {
             output,
             uav_in: uav.ok_or("UAV 创建失败")?,
             srv_out: srv.ok_or("SRV 创建失败")?,
+            uav_luma: luma_uav.ok_or("亮度缓冲 UAV 创建失败")?,
+            srv_luma: luma_srv.ok_or("亮度缓冲 SRV 创建失败")?,
             cb: cb.ok_or("常量缓冲创建失败")?,
             cs: cs.ok_or("CS 创建失败")?,
             vs: vs.ok_or("VS 创建失败")?,
@@ -766,9 +900,9 @@ impl GpuStylePipeline {
             tex_h,
             // HDR 桌面（scRGB）给的是线性 FP16，不转换会明显发灰/偏色
             to_srgb: matches!(desc.Format, DXGI_FORMAT_R16G16B16A16_FLOAT) as u32,
-            _pad0: 0,
+            exact: 0,
             hdr_scale: self.sdr_white_scale,
-            _pad1: 0.0,
+            luma_anchor: luma_anchor(),
         };
         self.update_params(&params)?;
 
@@ -778,10 +912,13 @@ impl GpuStylePipeline {
             ctx.CSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             ctx.CSSetShaderResources(0, Some(&[Some(srv.clone())]));
             ctx.CSSetUnorderedAccessViews(0, 1, Some(&[Some(self.uav_in.clone())] as *const _), None);
+            // u1：原图亮度，CS 顺手写下来给上屏做亮度锚定
+            ctx.CSSetUnorderedAccessViews(1, 1, Some(&[Some(self.uav_luma.clone())] as *const _), None);
             ctx.Dispatch(self.width.div_ceil(8), self.height.div_ceil(8), 1);
             // 立即解绑，避免同一资源同时被 SRV/UAV 绑定
             ctx.CSSetShaderResources(0, Some(&[None]));
             ctx.CSSetUnorderedAccessViews(0, 1, Some(&[None] as *const _), None);
+            ctx.CSSetUnorderedAccessViews(1, 1, Some(&[None] as *const _), None);
             ctx.CSSetShader(None::<&ID3D11ComputeShader>, None);
         }
         Ok(())
@@ -861,9 +998,10 @@ impl GpuStylePipeline {
             tex_w: self.width,
             tex_h: self.height,
             to_srgb: 0,
-            _pad0: 0,
+            // 源与目标同尺寸时直通（模型输出 → 同尺寸后缓冲是最常见的情况）
+            exact: (view_w == self.width && view_h == self.height) as u32,
             hdr_scale: 1.0,
-            _pad1: 0.0,
+            luma_anchor: luma_anchor(),
         })?;
         let ctx = &self.ctx11;
         unsafe {
@@ -883,16 +1021,417 @@ impl GpuStylePipeline {
             ctx.PSSetShader(&self.ps, None);
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             ctx.PSSetShaderResources(0, Some(&[Some(self.srv_out.clone())]));
+            // t1：原图亮度，用于把模型提亮的暗部拉回来
+            ctx.PSSetShaderResources(1, Some(&[Some(self.srv_luma.clone())]));
+            ctx.Draw(3, 0);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            ctx.PSSetShaderResources(1, Some(&[None]));
+        }
+        Ok(())
+    }
+
+}
+
+/// 纹理级后处理：超分中转用的渲染目标、读回/上传、纹理上屏。
+///
+/// 不依赖模型（不需要 ORT session），所以「只超分」模式也能单独用；
+/// 「模型 + 超分」模式下和 `GpuStylePipeline` 共用同一个 D3D11 设备。
+pub struct GpuBlit {
+    pub device11: ID3D11Device,
+    ctx11: ID3D11DeviceContext,
+    cb: ID3D11Buffer,
+    vs: ID3D11VertexShader,
+    ps_tex: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+    query: ID3D11Query,
+}
+
+impl GpuBlit {
+    pub fn new(device11: &ID3D11Device, ctx11: &ID3D11DeviceContext) -> Result<Self, String> {
+        let vs_blob = shader_blob(VS_SRC, b"VSMain\0", b"vs_5_0\0")?;
+        let ps_blob = shader_blob(PS_TEX_SRC, b"PSMain\0", b"ps_5_0\0")?;
+        let mut vs: Option<ID3D11VertexShader> = None;
+        let mut ps_tex: Option<ID3D11PixelShader> = None;
+        let mut sampler: Option<ID3D11SamplerState> = None;
+        let mut cb: Option<ID3D11Buffer> = None;
+        let mut query: Option<ID3D11Query> = None;
+        unsafe {
+            device11
+                .CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs))
+                .map_err(|e| format!("CreateVertexShader(blit): {e}"))?;
+            device11
+                .CreatePixelShader(blob_bytes(&ps_blob), None, Some(&mut ps_tex))
+                .map_err(|e| format!("CreatePixelShader(tex): {e}"))?;
+            device11
+                .CreateSamplerState(
+                    &D3D11_SAMPLER_DESC {
+                        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        ComparisonFunc: D3D11_COMPARISON_NEVER,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    },
+                    Some(&mut sampler),
+                )
+                .map_err(|e| format!("CreateSamplerState: {e}"))?;
+            device11
+                .CreateBuffer(
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: size_of::<Params>() as u32,
+                        Usage: D3D11_USAGE_DYNAMIC,
+                        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                        MiscFlags: 0,
+                        StructureByteStride: 0,
+                    },
+                    None,
+                    Some(&mut cb),
+                )
+                .map_err(|e| format!("创建常量缓冲(blit)失败: {e}"))?;
+            device11
+                .CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                )
+                .map_err(|e| format!("CreateQuery(blit): {e}"))?;
+        }
+        Ok(Self {
+            device11: device11.clone(),
+            ctx11: ctx11.clone(),
+            cb: cb.ok_or("常量缓冲(blit)创建失败")?,
+            vs: vs.ok_or("VS(blit) 创建失败")?,
+            ps_tex: ps_tex.ok_or("PS(tex) 创建失败")?,
+            sampler: sampler.ok_or("采样器创建失败")?,
+            query: query.ok_or("查询对象(blit)创建失败")?,
+        })
+    }
+
+    fn update_params(&mut self, params: &Params) -> Result<(), String> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.ctx11
+                .Map(&self.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .map_err(|e| format!("Map 常量缓冲(blit): {e}"))?;
+            std::ptr::copy_nonoverlapping(
+                params as *const Params as *const u8,
+                mapped.pData as *mut u8,
+                size_of::<Params>(),
+            );
+            self.ctx11.Unmap(&self.cb, 0);
+        }
+        Ok(())
+    }
+
+    /// 只等 GPU 完成，不搬数据
+    pub fn sync(&mut self) -> Result<(), String> {
+        let query = self.query.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        unsafe {
+            self.ctx11.End(&query);
+            self.ctx11.Flush();
+            loop {
+                let mut done: u32 = 0;
+                match self.ctx11.GetData(
+                    &query,
+                    Some(&mut done as *mut u32 as *mut c_void),
+                    4,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                ) {
+                    Ok(()) if done != 0 => return Ok(()),
+                    Ok(()) => {}
+                    Err(e) => return Err(format!("等待 GPU(blit) 失败: {e}")),
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err("等待 GPU(blit) 完成超时（5s）".into());
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// 建一张既能当渲染目标、又能被采样的 BGRA8 纹理（超分输入/输出中转用）
+    pub fn create_target(
+        &self,
+        w: u32,
+        h: u32,
+    ) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView), String> {
+        unsafe {
+            let mut tex: Option<ID3D11Texture2D> = None;
+            self.device11
+                .CreateTexture2D(
+                    &D3D11_TEXTURE2D_DESC {
+                        Width: w,
+                        Height: h,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                        CPUAccessFlags: 0,
+                        MiscFlags: 0,
+                    },
+                    None,
+                    Some(&mut tex),
+                )
+                .map_err(|e| format!("CreateTexture2D({w}x{h}): {e}"))?;
+            let tex = tex.ok_or("目标纹理为空")?;
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device11
+                .CreateRenderTargetView(&tex, None, Some(&mut rtv))
+                .map_err(|e| format!("CreateRenderTargetView: {e}"))?;
+            Ok((tex, rtv.ok_or("RTV 为空")?))
+        }
+    }
+
+    /// 读回一张 BGRA8 纹理（紧密排列，行距 = w*4）
+    pub fn read_bgra(&mut self, tex: &ID3D11Texture2D, w: u32, h: u32) -> Result<Vec<u8>, String> {
+        unsafe {
+            let mut staging: Option<ID3D11Texture2D> = None;
+            self.device11
+                .CreateTexture2D(
+                    &D3D11_TEXTURE2D_DESC {
+                        Width: w,
+                        Height: h,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_STAGING,
+                        BindFlags: 0,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                        MiscFlags: 0,
+                    },
+                    None,
+                    Some(&mut staging),
+                )
+                .map_err(|e| format!("staging 纹理({w}x{h}): {e}"))?;
+            let staging = staging.ok_or("staging 纹理为空")?;
+            self.ctx11.CopyResource(&staging, tex);
+            self.sync()?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx11
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| format!("Map staging: {e}"))?;
+            let row = (w * 4) as usize;
+            let mut out = vec![0u8; row * h as usize];
+            for y in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                    out.as_mut_ptr().add(y * row),
+                    row,
+                );
+            }
+            self.ctx11.Unmap(&staging, 0);
+            Ok(out)
+        }
+    }
+
+    /// 把 CPU 的 BGRA8 数据上传进纹理
+    pub fn upload_bgra(
+        &mut self,
+        tex: &ID3D11Texture2D,
+        data: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<(), String> {
+        let need = (w as usize) * (h as usize) * 4;
+        if data.len() < need {
+            return Err(format!("上传数据不足：{} < {need}", data.len()));
+        }
+        unsafe {
+            let res: ID3D11Resource = tex.cast().map_err(|e| format!("cast ID3D11Resource: {e}"))?;
+            self.ctx11
+                .UpdateSubresource(Some(&res), 0, None, data.as_ptr() as *const c_void, w * 4, 0);
+        }
+        Ok(())
+    }
+
+    /// 纹理 → 渲染目标：同尺寸直通，否则线性缩放（超分结果上屏）
+    pub fn draw_texture(
+        &mut self,
+        tex: &ID3D11Texture2D,
+        rtv: &ID3D11RenderTargetView,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Result<(), String> {
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        unsafe {
+            self.device11
+                .CreateShaderResourceView(tex, None, Some(&mut srv))
+                .map_err(|e| format!("纹理 SRV: {e}"))?;
+        }
+        let srv = srv.ok_or("纹理 SRV 为空")?;
+        self.update_params(&Params {
+            src_left: 0,
+            src_top: 0,
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            tex_w: src_w,
+            tex_h: src_h,
+            to_srgb: 0,
+            exact: (src_w == dst_w && src_h == dst_h) as u32,
+            hdr_scale: 1.0,
+            luma_anchor: luma_anchor(),
+        })?;
+        let ctx = &self.ctx11;
+        unsafe {
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: dst_w as f32,
+                Height: dst_h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            ctx.RSSetViewports(Some(&[viewport]));
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs, None);
+            ctx.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            ctx.PSSetShader(&self.ps_tex, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
             ctx.Draw(3, 0);
             ctx.PSSetShaderResources(0, Some(&[None]));
         }
         Ok(())
     }
 
+    /// 把源纹理的某个子矩形拷进目标纹理（同尺寸，GPU 内部拷贝）
+    pub fn copy_region(
+        &mut self,
+        dst: &ID3D11Texture2D,
+        src: &ID3D11Texture2D,
+        left: u32,
+        top: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<(), String> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            src.GetDesc(&mut desc);
+        }
+        // 越界就夹回纹理内，避免 CopySubresourceRegion 直接失败
+        let left = left.min(desc.Width.saturating_sub(1));
+        let top = top.min(desc.Height.saturating_sub(1));
+        let w = w.clamp(1, desc.Width - left);
+        let h = h.clamp(1, desc.Height - top);
+        unsafe {
+            self.ctx11.CopySubresourceRegion(
+                dst,
+                0,
+                0,
+                0,
+                0,
+                src,
+                0,
+                Some(&D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + w,
+                    bottom: top + h,
+                    back: 1,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    /// 从纹理的某个子矩形读回 CPU（BGRA8，紧密排列）：抓窗口纹理要先裁掉边框。
+    /// 仅超分路径目前走 copy_region + draw_texture（GPU 缩放），这里备用。
+    #[allow(dead_code)]
+    pub fn read_bgra_region(
+        &mut self,
+        tex: &ID3D11Texture2D,
+        left: u32,
+        top: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, String> {
+        unsafe {
+            let mut staging: Option<ID3D11Texture2D> = None;
+            self.device11
+                .CreateTexture2D(
+                    &D3D11_TEXTURE2D_DESC {
+                        Width: w,
+                        Height: h,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_STAGING,
+                        BindFlags: 0,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                        MiscFlags: 0,
+                    },
+                    None,
+                    Some(&mut staging),
+                )
+                .map_err(|e| format!("staging 纹理({w}x{h}): {e}"))?;
+            let staging = staging.ok_or("staging 纹理为空")?;
+            self.ctx11.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                tex,
+                0,
+                Some(&D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + w,
+                    bottom: top + h,
+                    back: 1,
+                }),
+            );
+            self.sync()?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx11
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| format!("Map staging: {e}"))?;
+            let row = (w * 4) as usize;
+            let mut out = vec![0u8; row * h as usize];
+            for y in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                    out.as_mut_ptr().add(y * row),
+                    row,
+                );
+            }
+            self.ctx11.Unmap(&staging, 0);
+            Ok(out)
+        }
+    }
+}
+
+impl GpuStylePipeline {
     /// 仅供自检：把模型输出显存存成 PNG（与上屏内容对照）
     #[cfg(test)]
     pub(crate) fn dump_output_png(&mut self, path: &str) -> Result<(), String> {
-        use opencv::core::{Mat, MatTraitManual, Scalar, Vector, CV_8UC3};
+        use opencv::core::{CV_8UC3, Mat, MatTraitManual, Scalar, Vector};
         let data = self.readback()?;
         let (w, h) = (self.width as usize, self.height as usize);
         let mut img = Mat::new_rows_cols_with_default(h as i32, w as i32, CV_8UC3, Scalar::all(0.0))
@@ -952,7 +1491,7 @@ impl GpuStylePipeline {
     /// 自检用：把任意 BGRA8 纹理（比如交换链后缓冲）存成 PNG，用于确认「真正上屏的像素」
     #[cfg(test)]
     pub(crate) fn dump_bgra_texture(&mut self, tex: &ID3D11Texture2D, path: &str) -> Result<(), String> {
-        use opencv::core::{Mat, MatTraitManual, Scalar, Vector, CV_8UC3};
+        use opencv::core::{CV_8UC3, Mat, MatTraitManual, Scalar, Vector};
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { tex.GetDesc(&mut desc) };
         let st = D3D11_TEXTURE2D_DESC {
@@ -1130,6 +1669,18 @@ impl GpuStylePipeline {
     }
 }
 
+/// 不跑模型（只做超分）时用的独立 D3D11 设备：默认适配器 + BGRA 支持
+pub fn create_standalone_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+    let device = try_create_d3d11(
+        LUID::default(),
+        false,
+        &[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0],
+    )?;
+    let ctx = unsafe { device.GetImmediateContext() }
+        .map_err(|e| format!("GetImmediateContext: {e}"))?;
+    Ok((device, ctx))
+}
+
 fn create_d3d11_device(luid: LUID) -> Result<ID3D11Device, String> {
     let mut errors = Vec::new();
     for use_luid in [true, false] {
@@ -1238,13 +1789,190 @@ mod tests {
         }
     }
 
+    /// 验证亮度锚定后的**最终上屏画面**：走 present 读回，再和原图分桶比亮度
+    ///
+    /// `cargo test --bin animation_imagee tone_anchor_check -- --ignored --nocapture`
+    #[test]
+    #[ignore = "手动排查用：需要模型 + GPU"]
+    fn tone_anchor_check() {
+        use opencv::core::{
+            AlgorithmHint, Mat, MatTraitConstManual, MatTraitManual, Scalar, Size, Vector,
+        };
+        use opencv::{imgcodecs, imgproc};
+        let (w, h) = (512usize, 288usize);
+        let src = imgcodecs::imread("input.png", imgcodecs::IMREAD_COLOR).unwrap();
+        let mut small = Mat::default();
+        imgproc::resize(&src, &mut small, Size::new(w as i32, h as i32), 0.0, 0.0, imgproc::INTER_AREA)
+            .unwrap();
+        let mut bgra = Mat::default();
+        imgproc::cvt_color(&small, &mut bgra, imgproc::COLOR_BGR2BGRA, 0, AlgorithmHint::ALGO_HINT_DEFAULT)
+            .unwrap();
+        let bytes = bgra.data_bytes().unwrap().to_vec();
+
+        let mut p = GpuStylePipeline::new("AnimeGANv3_Hayao_36.onnx", w as u32, h as u32).unwrap();
+        let tex = p.make_texture(w as u32, h as u32, &bytes).unwrap();
+        p.upload_texture(&tex, 0, 0, w as u32, h as u32).unwrap();
+        p.sync().unwrap();
+        p.infer().unwrap();
+
+        let ctx = unsafe { p.device11().GetImmediateContext().unwrap() };
+        let mut blit = GpuBlit::new(p.device11(), &ctx).unwrap();
+        let (rt, rtv) = blit.create_target(w as u32, h as u32).unwrap();
+        p.present(&rtv, w as u32, h as u32).unwrap();
+        let shown = blit.read_bgra(&rt, w as u32, h as u32).unwrap();
+
+        let luma = |r: f32, g: f32, b: f32| 0.299 * r + 0.587 * g + 0.114 * b;
+        let mut buckets = vec![[0f64; 3]; 4];
+        for i in 0..w * h {
+            let b = small.data_bytes().unwrap()[i * 3] as f32;
+            let g = small.data_bytes().unwrap()[i * 3 + 1] as f32;
+            let r = small.data_bytes().unwrap()[i * 3 + 2] as f32;
+            let y_in = luma(r, g, b);
+            let y_out = luma(
+                shown[i * 4 + 2] as f32,
+                shown[i * 4 + 1] as f32,
+                shown[i * 4] as f32,
+            );
+            let idx = match y_in as u32 {
+                0..=31 => 0,
+                32..=63 => 1,
+                64..=127 => 2,
+                _ => 3,
+            };
+            buckets[idx][0] += y_in as f64;
+            buckets[idx][1] += y_out as f64;
+            buckets[idx][2] += 1.0;
+        }
+        eprintln!("上屏画面 vs 原图（lumaAnchor = {}）", luma_anchor());
+        for (name, b) in ["0-31", "32-63", "64-127", "128-255"].iter().zip(buckets.iter()) {
+            if b[2] > 0.0 {
+                eprintln!(
+                    "  {name:>8} → 原 {:6.1} / 上屏 {:6.1}（差 {:+.1}）",
+                    b[0] / b[2],
+                    b[1] / b[2],
+                    (b[1] - b[0]) / b[2]
+                );
+            }
+        }
+        // 量化「有没有把值硬钳到 0 / 255」：统计触到两端的通道比例
+        let (mut clipped_in, mut clipped_out, mut clipped_ch) = (0usize, 0usize, 0usize);
+        let mut sum_abs = 0f64;
+        for i in 0..w * h {
+            let src = &small.data_bytes().unwrap()[i * 3..i * 3 + 3];
+            let out = &shown[i * 4..i * 4 + 3];
+            for c in 0..3 {
+                if src[c] == 0 || src[c] == 255 {
+                    clipped_in += 1;
+                }
+                if out[c] == 0 || out[c] == 255 {
+                    clipped_out += 1;
+                }
+                sum_abs += (src[c] as f64 - out[c] as f64).abs();
+                clipped_ch += 1;
+            }
+        }
+        eprintln!(
+            "触到 0/255 的通道：原图 {:.3}% / 上屏 {:.3}%；平均通道差 {:.2}",
+            clipped_in as f64 * 100.0 / clipped_ch as f64,
+            clipped_out as f64 * 100.0 / clipped_ch as f64,
+            sum_abs / clipped_ch as f64
+        );
+
+        let mut img = Mat::new_rows_cols_with_default(
+            h as i32,
+            w as i32,
+            opencv::core::CV_8UC3,
+            Scalar::all(0.0),
+        )
+        .unwrap();
+        {
+            let buf = img.data_bytes_mut().unwrap();
+            for i in 0..w * h {
+                buf[i * 3] = shown[i * 4];
+                buf[i * 3 + 1] = shown[i * 4 + 1];
+                buf[i * 3 + 2] = shown[i * 4 + 2];
+            }
+        }
+        imgcodecs::imwrite("target/tone_anchor.png", &img, &Vector::<i32>::new()).unwrap();
+        eprintln!("已导出 target/tone_anchor.png");
+    }
+
+    /// 诊断：模型输出相对原图的亮度漂移（分桶统计，看暗部究竟被抬亮多少）
+    ///
+    /// `cargo test --bin animation_imagee tone_drift_model -- --ignored --nocapture`
+    #[test]
+    #[ignore = "手动排查用：需要模型 + GPU"]
+    fn tone_drift_model() {
+        use opencv::core::{AlgorithmHint, Mat, MatTraitConstManual, Size};
+        use opencv::{imgcodecs, imgproc};
+        let (w, h) = (512usize, 288usize);
+        let src = imgcodecs::imread("input.png", imgcodecs::IMREAD_COLOR).unwrap();
+        let mut small = Mat::default();
+        imgproc::resize(&src, &mut small, Size::new(w as i32, h as i32), 0.0, 0.0, imgproc::INTER_AREA)
+            .unwrap();
+        let mut bgra = Mat::default();
+        imgproc::cvt_color(&small, &mut bgra, imgproc::COLOR_BGR2BGRA, 0, AlgorithmHint::ALGO_HINT_DEFAULT)
+            .unwrap();
+        let bytes = bgra.data_bytes().unwrap().to_vec();
+
+        let mut p = GpuStylePipeline::new("AnimeGANv3_Hayao_36.onnx", w as u32, h as u32).unwrap();
+        let tex = p.make_texture(w as u32, h as u32, &bytes).unwrap();
+        p.upload_texture(&tex, 0, 0, w as u32, h as u32).unwrap();
+        p.sync().unwrap();
+        p.infer().unwrap();
+        let out = p.readback().unwrap();
+
+        // 原图（BGR）与输出（NHWC RGB，[-1,1]）都换算成 0..255 的亮度
+        let luma = |r: f32, g: f32, b: f32| 0.299 * r + 0.587 * g + 0.114 * b;
+        let mut buckets = vec![[0f64; 4]; 4]; // [原均值, 输出均值, 计数, 0]
+        for i in 0..w * h {
+            let b = small.data_bytes().unwrap()[i * 3] as f32;
+            let g = small.data_bytes().unwrap()[i * 3 + 1] as f32;
+            let r = small.data_bytes().unwrap()[i * 3 + 2] as f32;
+            let y_in = luma(r, g, b);
+            let y_out = luma(
+                (out[i * 3] + 1.0) * 127.5,
+                (out[i * 3 + 1] + 1.0) * 127.5,
+                (out[i * 3 + 2] + 1.0) * 127.5,
+            );
+            let idx = match y_in as u32 {
+                0..=31 => 0,
+                32..=63 => 1,
+                64..=127 => 2,
+                _ => 3,
+            };
+            buckets[idx][0] += y_in as f64;
+            buckets[idx][1] += y_out as f64;
+            buckets[idx][2] += 1.0;
+        }
+        eprintln!("原图亮度区间 → 原均值 / 输出均值 / 像素数");
+        for (i, (name, b)) in ["0-31", "32-63", "64-127", "128-255"]
+            .iter()
+            .zip(buckets.iter())
+            .enumerate()
+        {
+            if b[2] > 0.0 {
+                eprintln!(
+                    "  {name:>8} → {:6.1} / {:6.1} / {:8.0}（差 {:+.1}）",
+                    b[0] / b[2],
+                    b[1] / b[2],
+                    b[2],
+                    (b[1] - b[0]) / b[2]
+                );
+            } else {
+                eprintln!("  {name:>8} → 无像素（bucket {i}）");
+            }
+        }
+        let _ = Mat::default();
+    }
+
     /// 离屏对照（手动排查用）：真实截图分别走 GPU 直通和 CPU 参考，导出 PNG 便于肉眼比对
     ///
     /// `cargo test --bin animation_imagee dump_style_preview -- --ignored --nocapture`
     #[test]
     #[ignore = "手动排查用，会导出 PNG 到 target/"]
     fn dump_style_preview() {
-        use opencv::core::{AlgorithmHint, Mat, MatTraitConstManual, MatTraitManual, Scalar, Size, Vector, CV_8UC3};
+        use opencv::core::{AlgorithmHint, CV_8UC3, Mat, MatTraitConstManual, MatTraitManual, Scalar, Size, Vector};
         use opencv::{imgcodecs, imgproc};
         use ort::value::TensorRef;
         let (w, h) = (1024usize, 576usize);
@@ -1347,7 +2075,7 @@ mod tests {
     /// 经过 CS 归一化 + sRGB 编码后，模型输入应当还原成原始 sRGB 画面。
     #[test]
     fn hdr_scrgb_roundtrip() {
-        use opencv::core::{AlgorithmHint, Mat, MatTraitConstManual, MatTraitManual, Size, Vector, CV_8UC3};
+        use opencv::core::{AlgorithmHint, CV_8UC3, Mat, MatTraitConstManual, MatTraitManual, Size, Vector};
         use opencv::{imgcodecs, imgproc};
         let (w, h) = (512usize, 288usize);
 
@@ -1475,7 +2203,7 @@ mod tests {
     }
 
     fn save_bgr(data: &[u8], w: usize, h: usize, path: &str) {
-        use opencv::core::{Mat, MatTraitManual, Scalar, Vector, CV_8UC3};
+        use opencv::core::{CV_8UC3, Mat, MatTraitManual, Scalar, Vector};
         use opencv::imgcodecs;
         let mut img = Mat::new_rows_cols_with_default(h as i32, w as i32, CV_8UC3, Scalar::all(0.0))
             .unwrap();
